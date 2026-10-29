@@ -98,6 +98,9 @@ class RobotsRules:
         for g in applicable:
             signals.update(g.content_signals)
         self.content_signals = signals
+        self._compiled: List[Tuple[bool, int, "re.Pattern"]] = [
+            (is_allow, len(pattern), self._compile(pattern)) for is_allow, pattern in self.rules
+        ]
         self._cache: Dict[str, bool] = {}
 
     # ------------------------------------------------------------------ 解析
@@ -140,6 +143,7 @@ class RobotsRules:
                         continue
                     current.rules.append((is_allow, value))
             elif name == "content-signal":
+                seen_rule = True
                 for token in value.split(","):
                     token = token.strip()
                     if "=" not in token:
@@ -174,9 +178,8 @@ class RobotsRules:
     def _allowed(self, path: str) -> bool:
         best_len = -1
         best_allow = True
-        for is_allow, pattern in self.rules:
-            if self._compile(pattern).match(path):
-                plen = len(pattern)
+        for is_allow, plen, regex in self._compiled:
+            if regex.match(path):
                 if plen > best_len or (plen == best_len and is_allow):
                     best_len = plen
                     best_allow = is_allow

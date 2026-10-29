@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import os
-from urllib.parse import urlparse
 
 from .api import MisskeyApi
 from .http import HttpClient, HttpError, ResponseTooLarge, RobotsDisallowed
