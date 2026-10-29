@@ -1,0 +1,27 @@
+{
+  "user_agent": "FediMissBot/1.0 (+https://github.com/your-org/FediMiss; research; contact: you@example.org)",
+  "purpose": "research",
+  "respect_content_signals": true,
+
+  "download_media": true,
+  "download_media_types": ["image/"],
+  "max_media_bytes": 8388608,
+  "max_media_per_account": 60,
+
+  "notes_per_account": 100,
+  "notes_page_size": 100,
+  "include_replies": false,
+  "since": null,
+
+  "min_interval_seconds": 1.5,
+  "request_timeout": 30,
+  "max_retries": 4,
+
+  "instances": [
+    { "host": "misskey.io",    "users": ["syuilo", "blade4649"] },
+    { "host": "misskey.cloud", "users": ["RyuYomori", "Exile_E"] },
+    { "host": "nijimiss.moe",  "users": ["noc_turn", "rmch"] },
+    { "host": "misskey.design","users": ["souramble"] },
+    { "host": "misskey.flowers","users": ["admin"] }
+  ]
+}
