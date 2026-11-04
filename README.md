@@ -1,180 +1,182 @@
 # FediMiss
 
-跨 **Misskey** 多实例（instance）的**多模态**数据抓取工具：抓取账户 profile、帖子文本与图片（媒体元数据 +（合规时）实际图片文件）。
+跨 **Misskey**（及同源衍生软件）多实例的**公开数据采集工具**，面向 bot/human
+标注与跨实例泛化的社交机器人研究。
 
-设计原则是「**合规优先**」：抓取任何 URL 之前，先解析该 host 的 `robots.txt` 与
-`Content-Signal`（Cloudflare 的 AI 内容使用声明），被禁止就跳过并记录原因。
-**仅使用 Python 标准库**，无需安装第三方依赖（Python >= 3.8）。
+设计目标不是「抓得最多」，而是：
+
+- **账号归属准确** —— 每个账号都尽量关联到它的**原属实例**，而不是发现它的实例；
+- **实体关联正确** —— 实例 / 账号 / 帖子 / 关系 / 附件分层存储，主键与关联键明确；
+- **过程可复现** —— 配置版本、时间戳、失败原因全部留痕；
+- **失败可审计** —— 每次失败落 `errors` 表，可分类统计；
+- **可断点续采** —— 状态机 + SQLite，进程中断后重跑同一命令即可继续。
+
+采集设计参考了 FediData（`https://github.com/FDUDataNET/FediData`）的公开仓库与 README
+（BFS 分层队列、发现实例≠归属实例、实体分层、失败审计、媒体独立模块），
+但**没有复用其平台代码**：Misskey 与 Mastodon 在协议、分页、限流信号、ID 体系上
+差异很大，相关差异与逐模块对照见 [docs/fedidata_review.md](file:///users/Min/FediMiss/docs/fedidata_review.md)
+与 [docs/misskey_api_notes.md](file:///users/Min/FediMiss/docs/misskey_api_notes.md)。
 
 ---
 
-## 1. Misskey API 规则梳理
+## 1. 架构
 
-Misskey **不是 REST**：所有 HTTP API 都是 `POST /api/<endpoint>`，请求与响应均为 JSON。
+```
+config.json
+   │
+   ├─ discover   候选实例 → NodeInfo 校验 → robots.txt/Content-Signal → POST /api/meta
+   │
+   ├─ collect    账号发现（种子 + notes/local-timeline）
+   │             → BFS 关注关系（users/following、users/followers，分层、有预算、有终止条件）
+   │             → 资料刷新（users/show）
+   │             → 帖子采集（users/notes，untilId 游标分页）+ 附件元数据
+   │
+   ├─ media      附件下载（独立模块，按媒体 host 单独校验 robots，默认关闭）
+   │
+   ├─ export     instances/accounts/notes/follow_edges/account_id_mapping(/media).parquet
+   │             + collection_manifest.json
+   └─ report     data_quality_report.md（8 项必报指标 + 选择偏差声明）
+```
 
-| 项目 | 说明 |
+| 模块 | 职责 |
 | --- | --- |
-| 请求方式 | `POST`，`Content-Type: application/json` |
-| 鉴权 | 令牌放在请求体 JSON 的 `i` 字段；**公开数据（profile、公开帖子）匿名即可读取** |
-| 官方文档 | `https://<instance>/api-doc`（每个实例自带 API 文档） |
-| 限流 | 触发后返回 `HTTP 429` 并可能带 `Retry-After` 响应头 |
-| 流式 API | 有 WebSocket 流式接口，本工具未使用 |
+| [robots.py](file:///users/Min/FediMiss/fedimiss/robots.py) | RFC 9309 自实现的 robots.txt / Content-Signal 合规引擎 |
+| [http.py](file:///users/Min/FediMiss/fedimiss/http.py) | 逐 host 限速、429/`Retry-After` 指数退避、robots 强校验 |
+| [nodeinfo.py](file:///users/Min/FediMiss/fedimiss/nodeinfo.py) | NodeInfo 实例校验 + peer 列表扩展 |
+| [api.py](file:///users/Min/FediMiss/fedimiss/api.py) | `MisskeyAdapter`：请求构造 / 游标分页 / 错误分类 / 字段映射 |
+| [identity.py](file:///users/Min/FediMiss/fedimiss/identity.py) | **跨实例账号归属解析**与置信度分级 |
+| [discovery.py](file:///users/Min/FediMiss/fedimiss/discovery.py) | 实例发现校验、账号种子 |
+| [collect.py](file:///users/Min/FediMiss/fedimiss/collect.py) | 单实例 worker（BFS → 资料 → 帖子）与预算守卫 |
+| [media.py](file:///users/Min/FediMiss/fedimiss/media.py) | 附件下载（限流、重试、断点续传、磁盘预算、sha256 去重） |
+| [store.py](file:///users/Min/FediMiss/fedimiss/store.py) | SQLite（WAL）状态机与系统记录 |
+| [export.py](file:///users/Min/FediMiss/fedimiss/export.py) / [quality.py](file:///users/Min/FediMiss/fedimiss/quality.py) | Parquet 快照 / 数据质量报告 |
 
-本工具用到的公开端点：
+**仅用 Python 标准库**（urllib / ssl / json / sqlite3 / threading）。
+导出 Parquet 需要 pyarrow，本仓库用 vendored 版本（见 §4），不影响采集本身。
 
-| 端点 | 用途 | 关键参数 |
-| --- | --- | --- |
-| `meta` | 实例元信息（名称、软件版本、URL） | — |
-| `stats` | 实例统计（可选，失败不阻塞） | — |
-| `users/show` | 账户 profile | `username`（或 `userId` / `username`+`host`） |
-| `users/notes` | 账户帖子列表 | `userId`（必填）、`limit`(1–100)、`untilId`/`sinceId` 游标、`withFiles`、`withReplies` |
+## 2. Misskey API 与合规要点
 
-聚合抓取要点：
+完整实测笔记见 [docs/misskey_api_notes.md](file:///users/Min/FediMiss/docs/misskey_api_notes.md)。要点：
 
-* `users/notes` **必须传 `userId`**（传 `username` 会 400），所以先 `users/show` 拿 `id`。
-* 分页用 `untilId`（向更早翻）+ `limit`（单页上限 100），靠返回列表的最后一个 `id` 作为下一页游标。
-* 传 `withFiles: true` 后，帖子对象里的 `files[]` 会带上媒体元数据：
-  `id / url / thumbnailUrl / type / name / size / md5 / blurhash / isSensitive / properties(width,height)` —— 这就是**图片信息**。
-* 部分实例关闭了本地时间线（`LTL_DISABLED`），且 `notes/featured`、`users/search` 在部分实例需要令牌；本工具只用上面 4 个匿名可用端点。
+- Misskey **不是 REST**：全部 `POST /api/<endpoint>` + JSON body。
+- 分页是 `untilId` 游标（无 `Link` 响应头）；单页 `limit` 上限 100。
+- 实测**不返回** `x-ratelimit-*` 头 → 限流只能靠「按 host 固定最小间隔 + 429/`Retry-After` 退避」。
+- `users/notes` **必须传 `userId`**；`users/following` / `users/followers` 的匿名可用性**因实例而异**
+  （实测 `misskey.io` 返回 400 FORBIDDEN，`nijimiss.moe` 正常），代码逐实例探测后记录到
+  `instances.following_api` / `following_api`。
+- 实例元数据以 **NodeInfo** 为准；候选实例用 `/api/v1/instance/peers` 扩展。
+- 抓取前对**每个 host** 校验 robots.txt（含多分组合并、最长匹配优先）与 Content-Signal；
+  媒体 CDN 与实例本体的 robots 策略**分开**判定。
 
-## 2. robots.txt 实测结果（2026-10）
+只采集公开且允许访问的内容；不使用令牌访问非公开内容；不绕过封禁与访问限制。
 
-不同实例差异极大，抓取前必须逐 host 解析：
+## 3. 账号归属解析（本项目重点）
 
-| Host | `/api/` 是否允许 | 媒体 Host | 媒体是否允许 | Content-Signal |
-| --- | --- | --- | --- | --- |
-| `misskey.io` | 允许（`Allow: /`） | `media.misskeyusercontent.jp` | **禁止**（`Disallow: /`） | 无 |
-| `misskey.cloud` | 允许 | `media.misskey.cloud` | 允许（无 robots.txt） | 无 |
-| `nijimiss.moe` | 允许 | `media.nijimissusercontent.app` | 允许 | `ai-train=no` |
-| `misskey.design` | **禁止**（`Disallow: /api`） | `file.misskey.design` | 允许 | `search=yes,ai-train=no,use=reference` |
-| `misskey.art` | **禁止** | `files.misskey.art` | 允许 | — |
-| `misskey.flowers` | **禁止** | — | — | `ai-train=no` |
-| `misskey.niri.la` / `misskey.systems` / `misskey.stream` / `misskey.pm` / `misskey.social` / `sushi.ski` / `voskey.icalo.net` | **禁止** | — | — | — |
-| `media.misskeyusercontent.com` | — | — | **禁止** | — |
+`host` / `url` / `uri` 三类证据 + 四级置信度，写入 `account_id_mapping`：
 
-两个必须注意的实测结论：
+| confidence | 含义 |
+| --- | --- |
+| `verified` | 在**账号原属实例**上查到该账号且返回 `host == null` |
+| `declared` | 原属实例来自远端缓存对象的 `host` 字段（归属已知、本地 ID 未知） |
+| `inferred` | 仅由 `uri`（`https://<host>/users/<id>`）推断 |
+| `unresolved` | 无法可靠判定 —— **留空，不猜测**（只写映射表，不进账号表） |
 
-1. **很多实例用 Cloudflare「Managed robots.txt」，会额外下发一组 `User-agent: *` 且 `Disallow: /api`。**
-   一个 robots.txt 里因此可能出现**多个 `User-agent: *` 分组**——标准库
-   `urllib.robotparser` 只采用**第一个**匹配分组，会把 `/api` 的 `Disallow` 漏掉。
-   本工具按 **RFC 9309** 自行实现匹配：合并所有匹配分组，路径取「最长匹配优先，同长度 Allow 优先」。
-2. **媒体 CDN 的 robots.txt 与实例本体是分开的**，`media.misskeyusercontent.jp` 是 `Disallow: /`。
-   即：可以读 API 元数据，但不应用爬虫去下载该 CDN 上的图片文件。
+Misskey 的 `id` **只在返回它的实例上有意义**，因此绝不作为跨实例身份；
+也绝不因用户名相同就合并账号。
 
-## 3. 合规策略（代码如何遵守）
-
-对应实现见 [fedimiss/robots.py](file:///users/Min/FediMiss/fedimiss/robots.py) 与 [fedimiss/http.py](file:///users/Min/FediMiss/fedimiss/http.py)。
-
-* **逐 host 解析 robots.txt**，按 `scheme://host` 缓存（默认 1 小时）。
-  * `2xx` → 按内容解析；`4xx`（含 404）→ 视为未声明、允许；`5xx`/网络错误 → 保守地**禁止**。
-* **抓取前强制校验**：`HttpClient` 每次请求前调用 `robots.can_fetch(url)`，不通过就抛
-  `RobotsDisallowed`，绝不发起请求（获取 robots.txt 自身除外）。
-* **实例级跳过**：若 `Disallow: /api`，整个实例跳过，并在 `compliance.json` 记录原因。
-* **Content-Signal 处理**：解析 `search / ai-input / ai-train / use` 声明并记录到 `compliance.json`。
-  当 `purpose = "ai-training"` 且某 host 声明 `ai-train=no` 时，跳过该 host 的内容；
-  默认 `purpose = "research"`，不触发该限制（但仍如实记录声明）。
-* **媒体独立校验**：图片 URL 属于哪个 host，就校验哪个 host 的 robots.txt；
-  被禁止时**只保留元数据**（`url`、`type`、`size`、`blurhash`、`dimensions` 等），不下载文件，
-  并把跳过原因写进记录的 `media[].skipped`（如 `robots` / `too_large` / `account_media_limit`）。
-* **限速**：同一 host 串行请求，最小间隔取 `max(min_interval_seconds, robots 的 Crawl-delay)`；
-  遇 `429`/`5xx` 指数退避 + 抖动，并优先使用 `Retry-After`。
-* **可识别 UA**：请把 `config.json` 里的 `user_agent` 换成**带真实联系方式**的标识。
-* **只抓公开数据**，不使用任何令牌去访问非公开内容。
-
-## 4. 目录结构
-
-```
-FediMiss/
-├── config.example.json      # 配置模板
-├── config.json              # 实际运行配置
-├── fedimiss/
-│   ├── __main__.py          # CLI 入口（含 --preflight 合规预检）
-│   ├── config.py            # 配置加载/校验
-│   ├── robots.py            # robots.txt + Content-Signal 合规引擎（RFC 9309 匹配）
-│   ├── http.py              # 限速 / 重试 / robots 拦截的 HTTP 客户端
-│   ├── api.py               # Misskey API 封装
-│   ├── crawler.py           # 多实例多模态抓取编排
-│   └── storage.py           # JSONL / profile / 媒体文件 / 合规报告存储
-└── data/                    # 抓取产物（已 gitignore）
-```
-
-## 5. 快速开始
+## 4. 快速开始
 
 ```bash
-# 1) 合规预检：只读 robots.txt / meta，确认哪些实例允许抓取
-python3 -m fedimiss --config config.json --preflight
+# 1) 探测并校验实例（只读 NodeInfo / robots.txt / meta）
+python3 -m fedimiss --config config.json discover
 
-# 2) 正式抓取（后台运行并写日志）
-nohup python3 -m fedimiss --config config.json --out data > data/run.out 2>&1 &
+# 2) 采集（后台运行；Ctrl-C / SIGTERM 会安全停止并回滚未完成任务）
+nohup python3 -m fedimiss --config config.json collect --workers 4 \
+  > data/run.out 2>&1 &
 
-# 常用参数
-python3 -m fedimiss --config config.json --limit 50 --no-media   # 每号最多 50 帖、不下载图片
-python3 -m fedimiss --config config.json --purpose ai-training   # 触发 Content-Signal 限制
+# 3) 查看进度 / 续采（重跑同一命令即续采）
+python3 -m fedimiss --config config.json status
+python3 -m fedimiss --config config.json collect --workers 4
+
+# 4) 导出 Parquet 与清单（需要 vendored pyarrow）
+PYTHONPATH=/users/Min/FediMiss/.vendor/lib python3 -m fedimiss --config config.json export
+
+# 5) 生成数据质量与偏差报告
+python3 -m fedimiss --config config.json report
 ```
 
-`Ctrl-C` / `SIGTERM` 会在当前请求结束后安全停止。重复运行可**断点续爬**（已存在的帖子 `id` 会跳过）。
+`collect` 的可选参数：`--instances a,b`（只采指定实例）、`--workers N`、
+`--seed-pages N`（每实例本地时间线翻页数）、`--no-discover`（不重新校验实例）。
 
-## 6. 输出格式
+## 5. 分阶段扩容
+
+同一套代码与状态库，只改 `config.json` 的 `limits` / `seed_instances` / `workers`：
+
+| 阶段 | 实例数 | 目标账号 | 关键配置 |
+| --- | --- | --- | --- |
+| A | 3–5 | ~5,000 | `max_instances=5`、`max_accounts_total=5000` |
+| B | 10–20 | ~30,000 | `max_instances=20`、`max_accounts_total=30000` |
+| C | — | 100,000 | `max_instances=40`、`max_accounts_total=100000` |
+
+每次 `collect` 都会把 `config.json` 的 SHA-256 前 16 位写入 `meta.config_version`，
+并随 `collection_manifest.json` 一起导出，用于固定「配置版本 + 时间戳」的可复现快照。
+
+## 6. 输出与交付物
+
+全部产物在 `storage.root`（默认 `data/`）：
 
 ```
 data/
-├── fedimiss.log                     # 运行日志
-├── crawl_log.jsonl                  # 每次运行的汇总
-└── <instance>/
-    ├── instance_meta.json           # 实例 meta/stats（含软件版本）
-    ├── compliance.json              # robots.txt / Content-Signal / 决策记录
-    └── users/<account>/
-        ├── profile.json             # 账户 profile（多模态之「账户信息」）
-        ├── notes.jsonl              # 每行一条帖子
-        └── media/<noteId>-<fileId>.<ext>   # 合规允许时下载的图片
+├── fedimiss.sqlite3              # 状态库（断点续采 / 审计的事实来源）
+├── fedimiss.log
+├── instances.parquet             # 实例信息
+├── accounts.parquet              # 账号信息（含归属状态）
+├── notes.parquet                 # 公开帖子
+├── follow_edges.parquet          # 关注关系边
+├── account_id_mapping.parquet    # 跨实例归属解析映射与置信度
+├── media.parquet                 # 附件元数据（多模态）
+├── collection_manifest.json      # 配置版本 / 计数 / 文件校验和 / 实例清单
+├── data_quality_report.md        # 8 项质量指标 + 选择偏差声明
+└── media/<host>/<xx>/<sha256>.<ext>   # 仅在 media.download=true 且 robots 允许时
 ```
 
-`notes.jsonl` 每行结构：
+文档类交付物：[docs/fedidata_review.md](file:///users/Min/FediMiss/docs/fedidata_review.md)（FediData 逐模块审查 + Misskey 适配差异）、
+[docs/misskey_api_notes.md](file:///users/Min/FediMiss/docs/misskey_api_notes.md)、
+[docs/annotation_guidelines.md](file:///users/Min/FediMiss/docs/annotation_guidelines.md)（人工标注指南）。
 
-```json
-{
-  "instance": "misskey.cloud",
-  "account": "Exile_E",
-  "fetched_at": "2026-10-29T03:28:57Z",
-  "note": { "id": "...", "createdAt": "...", "text": "...", "cw": null, "files": [ ... ], "reactions": {...} },
-  "media": [
-    {
-      "id": "...", "url": "https://media.misskey.cloud/files/....webp",
-      "type": "image/jpeg", "name": "IMG_0032.jpeg", "size": 94024,
-      "isSensitive": false, "blurhash": "eKHU^Gog...", 
-      "local_path": "misskey.cloud/users/Exile_E/media/....jpeg",
-      "skipped": null, "downloaded_bytes": 26398
-    }
-  ]
-}
-```
+## 7. 配置项
 
-## 7. 配置项（config.json）
+见 [config.example.json](file:///users/Min/FediMiss/config.example.json)。主要项：
 
-| 字段 | 默认 | 说明 |
+| 分组 | 键 | 说明 |
 | --- | --- | --- |
-| `user_agent` | 占位符 | **请改成带真实联系方式的 UA** |
-| `purpose` | `research` | `research` 或 `ai-training`；后者会触发 `ai-train=no` 跳过 |
-| `respect_content_signals` | `true` | 是否遵循 Content-Signal |
-| `download_media` | `true` | 是否下载图片文件；`false` 时只存元数据 |
-| `download_media_types` | `["image/"]` | 允许下载的 MIME 前缀 |
-| `max_media_bytes` | 8 MiB | 单文件大小上限 |
-| `max_media_per_account` | 200 | 每账户下载图片数量上限 |
-| `notes_per_account` | 200 | 每账户抓取帖子数上限 |
-| `notes_page_size` | 100 | 单页大小（API 上限 100） |
-| `include_replies` | `false` | 是否包含回复 |
-| `since` | `null` | 只抓该时间之后的帖子（ISO8601） |
-| `min_interval_seconds` | 1.5 | 同 host 最小请求间隔 |
-| `max_retries` | 4 | 429/5xx 重试次数 |
-| `instances` | `[]` | `[{"host": "...", "users": ["a","b"]}]` |
+| 顶层 | `user_agent` / `contact` | **请改成带真实联系方式的标识** |
+| 顶层 | `purpose` | `research` 或 `ai-training`；后者会触发 `ai-train=no` 跳过 |
+| 顶层 | `respect_content_signals` | 是否遵循 Content-Signal |
+| `limits` | `max_instances` / `max_accounts_total` / `max_accounts_per_instance` | 实例与账号预算 |
+| `limits` | `max_bfs_depth` / `max_relations_per_account` | BFS 终止条件 |
+| `limits` | `max_bfs_accounts_per_instance` | 单实例单轮 BFS 账号上限：BFS 不排空就不进入资料/帖子阶段，设上限保证每轮都能产出完整快照；剩余账号留给下一轮续采 |
+| `limits` | `notes_per_account` / `max_notes_total` / `max_requests_per_instance` | 帖子与请求预算。`notes_per_account` 是**单账号硬上限**（小于一页时会压小请求 `limit`） |
+| `limits` | `relation_forbidden_threshold` | `users/following|followers` 需连续 N 个账号返回 400 才判定为**实例级**限制（该错误多为账号级隐私，见下） |
+| `limits` | `max_candidates` | 候选实例上限（种子 + peer 扩展），防止实例校验无界扩散 |
+| `rate` | `min_interval_seconds` / `max_retries` | 逐 host 最小间隔与重试 |
+| `media` | `download` / `types` / `max_total_bytes` | 附件下载开关与配额 |
+| `workers` | `instance_workers` | 并行实例数（同实例始终串行） |
 
-## 8. 注意事项与已知限制
+## 8. 已知限制与注意事项
 
-* **务必**把 `user_agent` 换成可联系的标识，并保持 `min_interval_seconds` 足够大（建议 ≥ 1s）。
-* 若某实例 robots.txt 禁止 `/api`，本工具会跳过它——这是**预期行为**，不是故障；
-  如确需抓取，请先获得该实例运营方的**明确授权**，再调整策略（本工具不提供绕过开关）。
-* `misskey.io` 的图片托管在 `media.misskeyusercontent.jp`（`Disallow: /`），因此
-  **该实例只会产出图片元数据，不会下载图片文件**；这是遵守 robots.txt 的结果。
-* 抓取到的内容版权归原作者所有。用于 AI 训练前，请遵守目标实例的
-  `Content-Signal`（`ai-train=no` 表示**不得**用于训练）以及当地法律法规。
-* 部分字段（如 `followersCount`）对匿名请求可能返回 0 或被隐藏。
+- **账号级隐私 ≠ 实例级限制**：Misskey 的 `users/following` / `users/followers` 常对
+  个别账号返回 `400 FORBIDDEN`，实测同一实例（nijimiss.moe）上约四成账号如此，其余正常 ——
+  这是账号隐私设置。只有连续 `relation_forbidden_threshold` 个账号都失败才判定为实例级。
+- **`bfs_status` 的取值**：`pending` / `running` / `completed` / `error` / `out_of_scope`（原属实例不在本轮目标内）
+  / `unavailable`（该实例关系端点匿名不可用，关系数据无法采集，属实例级限制）。
+  `unavailable` 是终态，避免账号永远停在 `pending` 使「剩余任务」失真。
+- `is_bot_declared` 只是平台自我声明字段，**不是**最终 bot/human 标签；
+  需按 [docs/annotation_guidelines.md](file:///users/Min/FediMiss/docs/annotation_guidelines.md) 人工标注。
+- 若实例 robots.txt 禁止 `/api`，本工具会跳过该实例并记录原因 —— 这是**预期行为**，
+  不提供任何绕过开关。
+- `media.download` 默认 `false`：首轮只保留附件元数据。部分媒体 CDN 是 `Disallow: /`，
+  即使打开开关也不会下载这些 host 的文件。
+- 采集样本带有明确的选择偏差（实例选择、公开时间线发现、BFS 深度、API 可访问性），
+  **不能**当作整个 Misskey 网络的代表性样本；详见数据质量报告。
+- 抓取内容版权归原作者所有；用于 AI 训练前请遵守目标实例的 Content-Signal 与当地法规。
