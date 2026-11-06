@@ -34,6 +34,7 @@ import json
 import math
 import os
 import random
+import re
 import sqlite3
 import statistics
 import sys
@@ -151,14 +152,58 @@ def _chunks(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
 # 抽样
 # --------------------------------------------------------------------------- #
 
-def load_population(conn: sqlite3.Connection, window_id: Optional[str]) -> List[Dict[str, Any]]:
-    """候选账号 = 已采集到帖子的账号 ∪ ``notes_status='completed'`` 的账号。
+REQUIRE_CHOICES = ("profile", "notes", "media")
 
-    后者包含「采集完成但确实没有公开帖子」的账号，是 ``uncertain`` 的重要对照。
+
+def parse_require(value: Optional[str]) -> frozenset:
+    """解析 ``--require profile,notes,media``；``full`` 是三者别名。"""
+    if not value:
+        return frozenset()
+    items = {item.strip().lower() for item in value.split(",") if item.strip()}
+    if "full" in items:
+        return frozenset(REQUIRE_CHOICES)
+    unknown = items - set(REQUIRE_CHOICES)
+    if unknown:
+        raise SystemExit("未知 --require 项：%s（可选 %s 或 full）"
+                         % (",".join(sorted(unknown)), "/".join(REQUIRE_CHOICES)))
+    return frozenset(items)
+
+
+def load_population(conn: sqlite3.Connection, window_id: Optional[str],
+                    require: frozenset = frozenset()) -> List[Dict[str, Any]]:
+    """候选账号集合。
+
+    - 默认：已采集到帖子的账号 ∪ ``notes_status='completed'`` 的账号
+      （后者包含「采集完成但确实没有公开帖子」的账号，是 ``uncertain`` 的重要对照）；
+    - ``--require profile,notes,media``：只保留「资料完整 + 有帖子 + 有媒体记录」
+      的账号（当前数据库中恰为 8,775 个），这是正式标注总体。
     """
     note_filter = " AND n.window_id = ?" if window_id else ""
     note_params: Tuple[Any, ...] = (window_id,) if window_id else ()
     count_filter = " WHERE window_id = ?" if window_id else ""
+
+    conditions: List[str] = []
+    media_join = ""
+    if require:
+        if "profile" in require:
+            conditions.append("a.profile_status = 'completed'")
+        if "notes" in require:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM notes n"
+                f" WHERE n.author_account_key = a.account_key{note_filter})"
+            )
+        if "media" in require:
+            # media 表没有 author_account_key 索引，用一次性聚合 JOIN，
+            # 避免对每个账号做相关子查询全表扫描
+            media_join = (" LEFT JOIN (SELECT DISTINCT author_account_key AS k FROM media) med"
+                          " ON med.k = a.account_key")
+            conditions.append("med.k IS NOT NULL")
+    else:
+        conditions.append(
+            "(a.notes_status = 'completed'"
+            " OR EXISTS (SELECT 1 FROM notes n"
+            f" WHERE n.author_account_key = a.account_key{note_filter}))"
+        )
     sql = f"""
         SELECT a.account_key, a.username, a.host, a.instance_domain, a.display_name,
                a.description, a.created_at, a.followers_count, a.following_count,
@@ -166,16 +211,12 @@ def load_population(conn: sqlite3.Connection, window_id: Optional[str]) -> List[
                a.profile_status, a.language, a.location, a.birthday, a.fields_json,
                a.discovery_instance, a.bfs_status,
                COALESCE(c.n, 0) AS collected_notes
-        FROM accounts a
+        FROM accounts a{media_join}
         LEFT JOIN (
             SELECT author_account_key, COUNT(*) AS n FROM notes{count_filter}
             GROUP BY author_account_key
         ) c ON c.author_account_key = a.account_key
-        WHERE a.notes_status = 'completed'
-           OR EXISTS (
-                SELECT 1 FROM notes n
-                WHERE n.author_account_key = a.account_key{note_filter}
-           )
+        WHERE {" AND ".join(conditions)}
     """
     params: List[Any] = list(note_params) + list(note_params)
     return [dict(row) for row in conn.execute(sql, params)]
@@ -242,13 +283,71 @@ def sample_accounts(rows: Sequence[Dict[str, Any]], n: int, seed: int,
 # 统计
 # --------------------------------------------------------------------------- #
 
+def _timing_stats(times: Sequence[datetime]) -> Dict[str, Any]:
+    """发帖节奏统计。注意：跨采集窗口的整体统计会被「未采集区间」拉大间隔，
+    因此调用方应优先看单个窗口内的 ``primary_window`` 结果。"""
+    times = sorted(times)
+    total = len(times)
+    if total == 0:
+        return {"gap_median_seconds": None, "gap_iqr_seconds": None, "gap_cv": None,
+                "modal_interval_minutes": None, "modal_interval_share": None,
+                "hour_entropy": None, "minute_entropy": None, "top_minute_share": None,
+                "active_hours": 0, "active_days": 0, "max_notes_per_day": 0,
+                "max_notes_in_1h": 0, "posts_per_active_day": None}
+
+    gaps = [(b - a).total_seconds() for a, b in zip(times, times[1:])
+            if (b - a).total_seconds() > 0]
+    gap_sorted = sorted(gaps)
+    hour_counts = Counter(t.hour for t in times)
+    minute_counts = Counter(t.minute for t in times)
+    day_counts = Counter(t.date().isoformat() for t in times)
+
+    gap_stats: Dict[str, Any] = {
+        "median_seconds": _round(statistics.median(gaps), 1) if gaps else None,
+        "iqr_seconds": None, "cv": None, "modal_minutes": None, "modal_share": None,
+    }
+    if gaps:
+        q1 = _percentile(gap_sorted, 0.25)
+        q3 = _percentile(gap_sorted, 0.75)
+        gap_stats["iqr_seconds"] = _round(q3 - q1, 1)
+        mean = statistics.fmean(gaps)
+        gap_stats["cv"] = _round(statistics.pstdev(gaps) / mean, 4) if mean else None
+        modal = Counter(int(round(g / 60)) for g in gaps).most_common(1)[0]
+        gap_stats["modal_minutes"] = modal[0]
+        gap_stats["modal_share"] = _round(modal[1] / len(gaps), 4)
+
+    burst = 0
+    left = 0
+    for right, moment in enumerate(times):
+        while moment - times[left] > timedelta(hours=1):
+            left += 1
+        burst = max(burst, right - left + 1)
+
+    return {
+        "gap_median_seconds": gap_stats["median_seconds"],
+        "gap_iqr_seconds": gap_stats["iqr_seconds"],
+        "gap_cv": gap_stats["cv"],
+        "modal_interval_minutes": gap_stats["modal_minutes"],
+        "modal_interval_share": gap_stats["modal_share"],
+        "hour_entropy": _entropy(hour_counts.values()),
+        "minute_entropy": _entropy(minute_counts.values()),
+        "top_minute_share": _round(minute_counts.most_common(1)[0][1] / total, 4) if total else None,
+        "active_hours": len(hour_counts),
+        "active_days": len(day_counts),
+        "max_notes_per_day": max(day_counts.values()) if day_counts else 0,
+        "max_notes_in_1h": burst,
+        "posts_per_active_day": _round(total / len(day_counts), 2) if day_counts else None,
+    }
+
+
 class _Accumulator:
     """单账号的流式累加器：帖子按 created_at 升序喂入。"""
 
     __slots__ = ("account_key", "times", "n", "n_reply", "n_renote", "n_media",
                  "n_cw", "langs", "visibilities", "reply_targets", "text_lens",
-                 "text_hashes", "template_counter", "samples", "seen", "seed",
-                 "window_counts", "src_instances")
+                 "text_hashes", "template_counter", "template_preview", "samples",
+                 "seen", "seed", "sample_size", "window_counts", "window_times",
+                 "src_instances")
 
     def __init__(self, account_key: str, seed: int, sample_size: int) -> None:
         self.account_key = account_key
@@ -266,16 +365,19 @@ class _Accumulator:
         self.seed = seed
         self.sample_size = sample_size
         self.window_counts: Counter = Counter()
+        self.window_times: Dict[str, List[datetime]] = defaultdict(list)
         self.src_instances: Counter = Counter()
 
     def add(self, row: sqlite3.Row) -> None:
         dt = _parse_ts(row["created_at"])
         text = row["text"] or ""
         self.seen += 1
+        window = row["window_id"] or "unclassified"
         if dt is not None:
             self.times.append(dt)
+            self.window_times[window].append(dt)
 
-        self.window_counts[row["window_id"] or "unclassified"] += 1
+        self.window_counts[window] += 1
         self.src_instances[row["source_instance"] or "unknown"] += 1
         if row["reply_id"] or row["reply_account_key"]:
             self.n_reply += 1
@@ -298,6 +400,7 @@ class _Accumulator:
             digest = hashlib.blake2b(normalized.encode("utf-8"), digest_size=8).hexdigest()
             self.text_hashes.add(digest)
             self.template_counter[digest] += 1
+            self.template_preview.setdefault(digest, text[:80])
 
         # 确定性蓄水池抽样：样本帖子按时间均匀分布，便于人工核验
         if len(self.samples) < self.sample_size:
@@ -320,40 +423,15 @@ class _Accumulator:
 
     def finalize(self) -> Dict[str, Any]:
         self.times.sort()
-        gaps = [
-            (b - a).total_seconds()
-            for a, b in zip(self.times, self.times[1:])
-            if (b - a).total_seconds() > 0
-        ]
-        gap_sorted = sorted(gaps)
-        hour_counts = Counter(t.hour for t in self.times)
-        minute_counts = Counter(t.minute for t in self.times)
-        day_counts = Counter(t.date().isoformat() for t in self.times)
-
-        gap_stats: Dict[str, Any] = {
-            "n_intervals": len(gaps),
-            "median_seconds": _round(statistics.median(gaps), 1) if gaps else None,
-            "iqr_seconds": None,
-            "cv": None,
-            "modal_minutes": None,
-            "modal_share": None,
-        }
-        if gaps:
-            q1 = _percentile(gap_sorted, 0.25)
-            q3 = _percentile(gap_sorted, 0.75)
-            gap_stats["iqr_seconds"] = _round(q3 - q1, 1)
-            mean = statistics.fmean(gaps)
-            gap_stats["cv"] = _round(statistics.pstdev(gaps) / mean, 4) if mean else None
-            modal = Counter(int(round(g / 60)) for g in gaps).most_common(1)[0]
-            gap_stats["modal_minutes"] = modal[0]
-            gap_stats["modal_share"] = _round(modal[1] / len(gaps), 4)
-
-        burst = 0
-        left = 0
-        for right, t in enumerate(self.times):
-            while t - self.times[left] > timedelta(hours=1):
-                left += 1
-            burst = max(burst, right - left + 1)
+        timing = _timing_stats(self.times)
+        # 跨窗口的整体间隔会被「未采集区间」污染，主窗口内统计更可靠
+        primary = max(self.window_times.items(), key=lambda kv: len(kv[1]), default=None)
+        if primary and len(primary[1]) >= 20:
+            timing["primary_window"] = {"window_id": primary[0],
+                                        "notes_in_window": len(primary[1]),
+                                        **_timing_stats(primary[1])}
+        else:
+            timing["primary_window"] = None
 
         n_text = sum(1 for length in self.text_lens if length > 0)
         top_hash, top_count = (None, 0)
@@ -368,22 +446,7 @@ class _Accumulator:
             "last_note_at": _iso(self.times[-1]) if self.times else None,
             "span_days": _round((self.times[-1] - self.times[0]).total_seconds() / 86400, 2)
             if len(self.times) > 1 else (0.0 if self.times else None),
-            "timing": {
-                "gap_median_seconds": gap_stats["median_seconds"],
-                "gap_iqr_seconds": gap_stats["iqr_seconds"],
-                "gap_cv": gap_stats["cv"],
-                "modal_interval_minutes": gap_stats["modal_minutes"],
-                "modal_interval_share": gap_stats["modal_share"],
-                "hour_entropy": _entropy(hour_counts.values()),
-                "minute_entropy": _entropy(minute_counts.values()),
-                "top_minute_share": _round(minute_counts.most_common(1)[0][1] / self.n, 4)
-                if self.n else None,
-                "active_hours": len(hour_counts),
-                "active_days": len(day_counts),
-                "max_notes_per_day": max(day_counts.values()) if day_counts else 0,
-                "max_notes_in_1h": burst,
-                "posts_per_active_day": _round(self.n / len(day_counts), 2) if day_counts else None,
-            },
+            "timing": timing,
             "content": {
                 "duplicate_rate": _round((n_text - len(self.text_hashes)) / n_text, 4)
                 if n_text else None,
@@ -514,6 +577,7 @@ def build_pack(row: Dict[str, Any], stats: Dict[str, Any], edges: Dict[str, int]
     return {
         "evidence_version": EVIDENCE_VERSION,
         "account_key": row["account_key"],
+        "instance_domain": instance,
         "account_url": row.get("url"),
         "profile": _profile(row),
         "collection": {
@@ -556,7 +620,8 @@ def build_pack(row: Dict[str, Any], stats: Dict[str, Any], edges: Dict[str, int]
 
 def build_evidence(db_path: str, out_path: str, sample: int, seed: int,
                    window_id: Optional[str] = None,
-                   account_keys: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+                   account_keys: Optional[Sequence[str]] = None,
+                   require: frozenset = frozenset()) -> Dict[str, Any]:
     conn = _connect(db_path)
     try:
         if account_keys:
@@ -576,8 +641,13 @@ def build_evidence(db_path: str, out_path: str, sample: int, seed: int,
                 row["sampling_seed"] = None
             picked = rows
         else:
-            population = load_population(conn, window_id)
-            picked = sample_accounts(population, sample, seed)
+            population = load_population(conn, window_id, require)
+            picked = sample_accounts(population, sample, seed) if sample > 0 else population
+            if sample <= 0:
+                for row in picked:
+                    row["sampling_method"] = "full"
+                    row["sampling_stratum"] = None
+                    row["sampling_seed"] = None
 
         keys = [row["account_key"] for row in picked]
         stats = compute_stats(conn, keys, window_id)
@@ -598,6 +668,8 @@ def build_evidence(db_path: str, out_path: str, sample: int, seed: int,
     summary = {
         "db": os.path.abspath(db_path),
         "out": os.path.abspath(out_path),
+        "require": sorted(require) if require else "default",
+        "population": len(population) if not account_keys else None,
         "accounts": len(picked),
         "window_scope": window_id,
         "seed": seed,
@@ -616,10 +688,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--window-id", default=None, help="只统计该窗口的帖子")
     parser.add_argument("--account-key", action="append", default=None,
                         help="指定账号（可重复），忽略 --sample")
+    parser.add_argument("--require", default=None,
+                        help="限定标注总体：profile,notes,media（或 full）；"
+                             "profile=资料已采集, notes=有帖子, media=有媒体记录")
     args = parser.parse_args(argv)
 
     summary = build_evidence(args.db, args.out, args.sample, args.seed,
-                             args.window_id, args.account_key)
+                             args.window_id, args.account_key,
+                             parse_require(args.require))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
