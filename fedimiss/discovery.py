@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Dict, List, Set
 
 from .api import ApiForbidden, ApiUnavailable, MisskeyAdapter
@@ -172,6 +174,119 @@ class Discovery:
             )
         self._log("info", "实例 %s 由本地时间线发现账号 %d 个", domain, found)
         return found
+
+    # ------------------------------------------------------------------ 搜索发现
+    USERNAME_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+    def seed_from_username_sweep(self, domain: str, budget: int) -> int:
+        """按用户名前缀字典序枚举本地账号，突破时间线回溯深度的限制。
+
+        前缀队列持久化在 meta 表（``username_sweep_queue:<domain>``），
+        跨轮次接力：取队首前缀查询一次；若返回恰好 100 条（可能被截断），
+        就把 36 个扩展前缀压回队列，后续轮次在用户密集的前缀上继续细分。
+        ``budget`` 为本次允许发起的搜索请求数。
+        """
+        alphabet = list(self.USERNAME_ALPHABET)
+        raw = self.store.get_meta("username_sweep_queue:%s" % domain)
+        queue: List[str] = []
+        if raw:
+            try:
+                queue = json.loads(raw) if isinstance(raw, str) else list(raw)
+            except (ValueError, TypeError):
+                queue = []
+        if not queue:
+            queue = list(alphabet)
+
+        adapter = MisskeyAdapter(domain, self.http, self.store, self.logger)
+        before = self.store.count_accounts("instance_domain=?", (domain,))
+        checked = 0
+        while queue and checked < budget and not self._stopped():
+            prefix = queue.pop(0)
+            try:
+                users = adapter.search_users_by_username(prefix, limit=100)
+            except (ApiForbidden, ApiUnavailable) as exc:
+                queue.insert(0, prefix)
+                self.store.set_meta("username_sweep_queue:%s" % domain, queue)
+                self._log(
+                    "info", "实例 %s 的用户名搜索不可用（%s），保存队列并终止本轮扫描",
+                    domain, type(exc).__name__,
+                )
+                return 0
+            except Exception as exc:  # noqa: BLE001
+                self.store.log_error(
+                    stage="discovery", instance_domain=domain,
+                    error_type="username_sweep_failed", subject=prefix,
+                    message=str(exc),
+                )
+                continue
+            checked += 1
+            for user in users:
+                if isinstance(user, dict):
+                    self.identity.register(user, domain, "username_sweep", depth=0)
+            # 返回满页说明该前缀下的账号可能超过 100 个，细分到下一层
+            if len(users) >= 100 and len(prefix) < 12:
+                queue.extend(prefix + ch for ch in alphabet)
+            if checked % 100 == 0:
+                self._log(
+                    "info", "实例 %s 用户名扫描进度：已查 %d 前缀，队列剩余 %d",
+                    domain, checked, len(queue),
+                )
+
+        self.store.set_meta("username_sweep_queue:%s" % domain, queue)
+        after = self.store.count_accounts("instance_domain=?", (domain,))
+        self._log(
+            "info", "实例 %s 用户名前缀扫描：查 %d 前缀，新登记 %d 个账号（实例现有 %d），队列剩余 %d",
+            domain, checked, after - before, after, len(queue),
+        )
+        return checked
+
+    def mine_hashtags(self, domain: str, top: int = 100) -> List[str]:
+        """从已采集帖子的正文中统计高频话题标签，作为搜索发现的关键词。"""
+        rows = self.store._rows(
+            "SELECT text FROM notes WHERE source_instance=? AND text IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 30000",
+            (domain,),
+        )
+        counts: Dict[str, int] = {}
+        for row in rows:
+            for tag in re.findall(r"#([^\s#.,!?:;、。！？：；()（）\[\]【】「」『』<>…・'\"～~]+)", row["text"] or ""):
+                tag = tag.strip()
+                if 2 <= len(tag) <= 30 and not tag.isdigit():
+                    counts[tag] = counts.get(tag, 0) + 1
+        ranked = [t for t, _ in sorted(counts.items(), key=lambda x: -x[1])[:top]]
+        self._log("info", "实例 %s 从最近帖子中挖掘出 %d 个高频标签", domain, len(ranked))
+        return ranked
+
+    def seed_from_hashtag_search(self, domain: str, tags: List[str], max_pages: int, budget: int) -> int:
+        """用话题标签逐个 ``notes/search``，登记命中的帖子作者。"""
+        adapter = MisskeyAdapter(domain, self.http, self.store, self.logger)
+        before = self.store.count_accounts("instance_domain=?", (domain,))
+        used = 0
+        for tag in tags:
+            if used >= budget or self._stopped():
+                break
+            try:
+                for note in adapter.search_notes("#%s" % tag, limit=100, max_pages=max_pages):
+                    user = note.get("user") if isinstance(note, dict) else None
+                    if isinstance(user, dict):
+                        self.identity.register(user, domain, "note_search", depth=0)
+                used += max_pages
+            except ApiForbidden:
+                self._log("info", "实例 %s 的 notes/search 匿名不可用，跳过标签搜索", domain)
+                break
+            except Exception as exc:  # noqa: BLE001
+                self.store.log_error(
+                    stage="discovery", instance_domain=domain,
+                    error_type="hashtag_search_failed", subject=tag,
+                    message=str(exc),
+                )
+                used += 1
+        after = self.store.count_accounts("instance_domain=?", (domain,))
+        self._log(
+            "info", "实例 %s 标签搜索：查 %d 个标签（约 %d 请求），新登记 %d 个账号",
+            domain, len(tags), used, after - before,
+        )
+        return after - before
 
 
 def _utc_now() -> str:

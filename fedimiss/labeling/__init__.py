@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-EVIDENCE_VERSION = "evidence_v1"
+EVIDENCE_VERSION = "evidence_v2"
 PROMPT_VERSION = "label_v1"
 LABELS = ("bot", "human", "uncertain")
 CONFIDENCES = ("high", "medium", "low")

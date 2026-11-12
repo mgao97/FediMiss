@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -47,6 +48,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import CONFIDENCES, EVIDENCE_VERSION, LABELS, PROMPT_VERSION
+from .retrieval import FewShotRetriever
 
 DEFAULT_PROMPT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "prompts", "label_v1.md")
@@ -57,13 +59,21 @@ DEFAULT_PROMPT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 # --------------------------------------------------------------------------- #
 
 def render_evidence(pack: Dict[str, Any]) -> str:
-    """把证据包渲染成紧凑、字段可引用的文本，控制 prompt 体积。"""
+    """把证据包渲染成紧凑、字段可引用的文本，控制 prompt 体积。
+
+    模型侧屏蔽 `profile.is_bot_declared`（自我声明字段）：模型只依据行为证据判断，
+    "是否抄声明"的问题在设计层面即被排除。声明字段仍保留在证据包文件中供溯源，
+    人工金标表中也保留该列（标注人可参考）。
+    """
     lines: List[str] = []
     lines.append("account_key: %s" % pack.get("account_key"))
     if pack.get("account_url"):
         lines.append("account_url: %s" % pack["account_url"])
     for section in ("profile", "collection", "timing", "content", "interaction", "media"):
-        lines.append("%s: %s" % (section, json.dumps(pack.get(section, {}), ensure_ascii=False)))
+        data = dict(pack.get(section, {}) or {})
+        if section == "profile":
+            data.pop("is_bot_declared", None)  # 模型不可见
+        lines.append("%s: %s" % (section, json.dumps(data, ensure_ascii=False)))
     lines.append("samples:")
     for idx, sample in enumerate(pack.get("samples", []), start=1):
         text = (sample.get("text") or "").replace("\n", " ")
@@ -98,9 +108,11 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
 def normalize_result(raw: Dict[str, Any]) -> Dict[str, Any]:
     label = str(raw.get("label", "")).strip().lower()
     confidence = str(raw.get("confidence", "")).strip().lower()
+    notes = str(raw.get("notes") or "").strip()[:300]
     if label not in LABELS:
         return {"label": "uncertain", "confidence": "low", "rule_ids": [],
-                "evidence": [], "uncertain_reason": "invalid_label:%s" % label,
+                "evidence": [], "notes": notes,
+                "uncertain_reason": "invalid_label:%s" % label,
                 "verification": raw.get("verification")}
     if confidence not in CONFIDENCES:
         confidence = "low"
@@ -109,14 +121,16 @@ def normalize_result(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     if label in ("bot", "human") and not evidence:
         return {"label": "uncertain", "confidence": "low", "rule_ids": rule_ids,
-                "evidence": [], "uncertain_reason": "model_no_evidence",
+                "evidence": [], "notes": notes,
+                "uncertain_reason": "model_no_evidence",
                 "verification": raw.get("verification")}
     if label == "uncertain" and not raw.get("uncertain_reason"):
         return {"label": "uncertain", "confidence": confidence, "rule_ids": rule_ids,
-                "evidence": evidence, "uncertain_reason": "unspecified",
+                "evidence": evidence, "notes": notes,
+                "uncertain_reason": "unspecified",
                 "verification": raw.get("verification")}
     return {"label": label, "confidence": confidence, "rule_ids": rule_ids,
-            "evidence": evidence,
+            "evidence": evidence, "notes": notes,
             "uncertain_reason": raw.get("uncertain_reason") if label == "uncertain" else None,
             "verification": raw.get("verification")}
 
@@ -127,14 +141,18 @@ def normalize_result(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def call_openai(base_url: str, model: str, api_key: Optional[str],
                 messages: List[Dict[str, str]], temperature: float,
-                max_tokens: int, timeout: float, retries: int = 3) -> str:
+                max_tokens: int, timeout: float, retries: int = 3,
+                extra_body: Optional[Dict[str, Any]] = None) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
-    payload = json.dumps({
+    body: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-    }).encode("utf-8")
+    }
+    if extra_body:
+        body.update(extra_body)  # 供应商特有参数，如 GLM 的 thinking
+    payload = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = "Bearer %s" % api_key
@@ -150,10 +168,10 @@ def call_openai(base_url: str, model: str, api_key: Optional[str],
             last_error = exc
             if exc.code not in (429, 500, 502, 503, 504):
                 raise
-            time.sleep((2 ** attempt) + random.random())
+            time.sleep(min(60.0, 4.0 * (2 ** attempt)) + random.random())
         except (urllib.error.URLError, TimeoutError, KeyError, ValueError) as exc:
             last_error = exc
-            time.sleep((2 ** attempt) + random.random())
+            time.sleep(min(60.0, 4.0 * (2 ** attempt)) + random.random())
     raise RuntimeError("LLM 调用失败：%s" % last_error)
 
 
@@ -221,9 +239,17 @@ class RateLimiter:
 
 
 def label_one(pack: Dict[str, Any], prompt: str, args: argparse.Namespace,
-              limiter: RateLimiter) -> Dict[str, Any]:
+              limiter: RateLimiter,
+              retriever: Optional[FewShotRetriever] = None) -> Dict[str, Any]:
     started = time.monotonic()
-    messages = [{"role": "user", "content": prompt.replace("{{EVIDENCE}}", render_evidence(pack))}]
+    evidence_text = render_evidence(pack)
+    retrieved_keys: List[str] = []
+    if "{{EXAMPLES}}" in prompt and retriever is not None:
+        examples, retrieved_keys = retriever.examples_for(pack)
+        content = prompt.replace("{{EXAMPLES}}", examples).replace("{{EVIDENCE}}", evidence_text)
+    else:
+        content = prompt.replace("{{EVIDENCE}}", evidence_text)
+    messages = [{"role": "user", "content": content}]
     votes: List[Dict[str, Any]] = []
     errors: List[str] = []
 
@@ -235,7 +261,8 @@ def label_one(pack: Dict[str, Any], prompt: str, args: argparse.Namespace,
             else:
                 text = call_openai(args.base_url, args.model, args.api_key, messages,
                                    args.temperature if args.votes == 1 else max(args.temperature, 0.7),
-                                   args.max_tokens, args.timeout)
+                                   args.max_tokens, args.timeout,
+                                   retries=args.retries, extra_body=args.extra_body)
                 parsed = extract_json(text)
                 if parsed is None:
                     raise ValueError("回复中找不到 JSON 对象")
@@ -247,8 +274,10 @@ def label_one(pack: Dict[str, Any], prompt: str, args: argparse.Namespace,
     if not votes:
         return {
             "account_key": pack["account_key"], "label": "uncertain", "confidence": "low",
-            "rule_ids": [], "evidence": [], "uncertain_reason": "llm_error",
+            "rule_ids": [], "evidence": [], "notes": "",
+            "uncertain_reason": "llm_error",
             "verification": None, "votes": [], "vote_agreement": 0.0,
+            "retrieved_keys": retrieved_keys,
             "error": "; ".join(errors)[:400],
             "latency_ms": int((time.monotonic() - started) * 1000),
         }
@@ -258,7 +287,7 @@ def label_one(pack: Dict[str, Any], prompt: str, args: argparse.Namespace,
     agreement = top_count / len(votes)
     if top_count * 2 <= len(votes):  # 未过半 → 降级
         final = {"label": "uncertain", "confidence": "low", "rule_ids": ["3.3"],
-                 "evidence": [], "uncertain_reason": "模型多票不一致",
+                 "evidence": [], "notes": "", "uncertain_reason": "模型多票不一致",
                  "verification": None}
     elif agreement >= 0.999:
         final = next(v for v in votes if v["label"] == top_label)
@@ -272,10 +301,12 @@ def label_one(pack: Dict[str, Any], prompt: str, args: argparse.Namespace,
         "confidence": final["confidence"],
         "rule_ids": final.get("rule_ids", []),
         "evidence": final.get("evidence", []),
+        "notes": final.get("notes", ""),
         "uncertain_reason": final.get("uncertain_reason"),
         "verification": final.get("verification"),
         "votes": votes,
         "vote_agreement": round(agreement, 3),
+        "retrieved_keys": retrieved_keys,
         "error": "; ".join(errors)[:400] if errors else None,
         "latency_ms": int((time.monotonic() - started) * 1000),
     }
@@ -302,10 +333,34 @@ def _resume_index(path: str, key_fields: Tuple[str, ...]) -> set:
     return done
 
 
+def _write_csv(path: str, records: List[Dict[str, Any]]) -> None:
+    """导出人工复核表：账号 / 标签 / 置信 / 检索案例 / 模型判定理由（notes）。"""
+    fields = ["account_key", "label", "confidence", "rule_ids", "notes",
+              "retrieved_keys", "uncertain_reason"]
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for record in records:
+            row = dict(record)
+            row["retrieved_keys"] = " ".join(record.get("retrieved_keys") or [])
+            writer.writerow(row)
+
+
 def run(args: argparse.Namespace) -> int:
     with open(args.prompt, "r", encoding="utf-8") as fh:
         template = fh.read()
     prompt_sha = hashlib.sha256(template.encode("utf-8")).hexdigest()[:16]
+
+    retriever: Optional[FewShotRetriever] = None
+    if "{{EXAMPLES}}" in template:
+        retriever = FewShotRetriever(args.fewshot_packs, args.fewshot_labels,
+                                     args.fewshot_sheet,
+                                     k_bot=args.k_bot, k_human=args.k_human)
+        n_bots = sum(1 for v in retriever.labels.values() if v == "bot")
+        print("few-shot 检索池：%d 账号（bot %d / human %d），每例注入 bot×%d + human×%d"
+              % (len(retriever.labels), n_bots, len(retriever.labels) - n_bots,
+                 args.k_bot, args.k_human), file=sys.stderr)
 
     packs: List[Dict[str, Any]] = []
     with open(args.input, "r", encoding="utf-8") as fh:
@@ -328,7 +383,8 @@ def run(args: argparse.Namespace) -> int:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     lock = threading.Lock()
     limiter = RateLimiter(args.qps)
-    counters = Counter()
+    counters: Counter = Counter()
+    records: List[Dict[str, Any]] = []
     total = 0
 
     with open(args.out, "a", encoding="utf-8") as out_fh, \
@@ -338,7 +394,7 @@ def run(args: argparse.Namespace) -> int:
             if (pack["account_key"], run_id) in done:
                 counters["skipped"] += 1
                 continue
-            futures[pool.submit(label_one, pack, template, args, limiter)] = pack
+            futures[pool.submit(label_one, pack, template, args, limiter, retriever)] = pack
             total += 1
 
         for future in as_completed(futures):
@@ -348,7 +404,8 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:  # 兜底，不让单条异常中断批处理
                 result = {"account_key": pack["account_key"], "label": "uncertain",
                           "confidence": "low", "uncertain_reason": "llm_error",
-                          "error": str(exc)[:400], "votes": [], "vote_agreement": 0.0}
+                          "notes": "", "error": str(exc)[:400], "votes": [],
+                          "vote_agreement": 0.0, "retrieved_keys": []}
             record = {
                 **result,
                 "prompt_version": PROMPT_VERSION,
@@ -360,6 +417,7 @@ def run(args: argparse.Namespace) -> int:
                 "run_id": run_id,
                 "labeled_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
+            records.append(record)
             with lock:
                 out_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                 out_fh.flush()
@@ -367,13 +425,18 @@ def run(args: argparse.Namespace) -> int:
                 if record.get("error"):
                     counters["with_error"] += 1
 
+    if args.out_csv:
+        _write_csv(args.out_csv, records)
+
     summary = {
         "run_id": run_id,
         "out": os.path.abspath(args.out),
+        "out_csv": os.path.abspath(args.out_csv) if args.out_csv else None,
         "prompt_sha256": prompt_sha,
+        "fewshot": retriever is not None,
         "model": "mock-rules-v1" if args.mock else args.model,
         "votes": max(1, args.votes),
-        "labeled": total - counters["skipped"],
+        "labeled": total,
         "skipped_existing": counters["skipped"],
         "labels": {label: counters[label] for label in LABELS},
         "with_error": counters["with_error"],
@@ -397,14 +460,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=600)
     parser.add_argument("--timeout", type=float, default=90.0)
+    parser.add_argument("--retries", type=int, default=3, help="网络/限流错误重试次数")
+    parser.add_argument("--extra-body", default=None,
+                        help='供应商特有请求参数（JSON），如 \'{"thinking":{"type":"disabled"}}\'')
     parser.add_argument("--limit", type=int, default=0, help="只标注前 N 条，用于冒烟")
     parser.add_argument("--account-key", action="append", default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--mock", action="store_true", help="不调用网络，用规则基线自检")
+    parser.add_argument("--fewshot-packs", default="data/labeling/evidence_gold400.jsonl",
+                        help="检索池证据包（必须与金标账号一致）")
+    parser.add_argument("--fewshot-labels", default="data/labeling/gold.jsonl",
+                        help="检索池人工标签 JSONL（禁止用模型预测标签）")
+    parser.add_argument("--fewshot-sheet", default="data/labeling/gold_sheet_400.csv",
+                        help="金标工作表，提供 notes_a/notes_b 人工理由")
+    parser.add_argument("--k-bot", type=int, default=2, help="每个 prompt 注入的相似 bot 案例数")
+    parser.add_argument("--k-human", type=int, default=2, help="每个 prompt 注入的相似 human 案例数")
+    parser.add_argument("--out-csv", default=None, help="导出含 notes 列的复核 CSV")
     args = parser.parse_args(argv)
     if not args.mock and not args.base_url:
         parser.error("需要 --base-url 或设置 FEDIMISS_LLM_BASE_URL")
+    args.extra_body = json.loads(args.extra_body) if args.extra_body else None
     return run(args)
 
 

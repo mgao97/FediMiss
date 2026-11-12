@@ -178,6 +178,22 @@ class MisskeyAdapter:
             max_pages,
         )
 
+    def search_notes(self, query: str, limit: int = 100, max_pages: int = 1) -> Iterator[Dict[str, Any]]:
+        """按关键词/话题标签全文搜索公开帖子（返回帖子内嵌 user 对象）。"""
+        return self._paginate("notes/search", {"query": query}, limit, max_pages)
+
+    def search_users_by_username(self, username: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """按用户名前缀搜索本实例用户（host=None 表示仅本地用户）。"""
+        data = self.call(
+            "users/search-by-username-and-host",
+            {
+                "username": username,
+                "host": None,
+                "limit": max(1, min(int(limit), MAX_LIMIT)),
+            },
+        )
+        return data if isinstance(data, list) else []
+
 
 # ---------------------------------------------------------------------- 字段映射
 def map_account(user: Dict[str, Any]) -> Dict[str, Any]:

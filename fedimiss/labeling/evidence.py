@@ -346,6 +346,7 @@ class _Accumulator:
     __slots__ = ("account_key", "times", "n", "n_reply", "n_renote", "n_media",
                  "n_cw", "langs", "visibilities", "reply_targets", "text_lens",
                  "text_hashes", "template_counter", "template_preview", "samples",
+                 "prefix_counter", "suffix_counter",
                  "seen", "seed", "sample_size", "window_counts", "window_times",
                  "src_instances")
 
@@ -360,6 +361,8 @@ class _Accumulator:
         self.text_hashes: set = set()
         self.template_counter: Counter = Counter()
         self.template_preview: Dict[str, str] = {}
+        self.prefix_counter: Counter = Counter()
+        self.suffix_counter: Counter = Counter()
         self.samples: List[Dict[str, Any]] = []
         self.seen = 0
         self.seed = seed
@@ -401,6 +404,13 @@ class _Accumulator:
             self.text_hashes.add(digest)
             self.template_counter[digest] += 1
             self.template_preview.setdefault(digest, text[:80])
+            # 模板模式归并：数字/计数归并为 #，专抓「固定句式 + 日期/期号/作品名」型
+            # 定时模板系列（整帖模板在 12 条随机样本里可能一次都抽不到）
+            normed = re.sub(r"\d+", "#", _normalize_text(text))
+            normed = re.sub(r"\s+", "", normed)
+            if len(normed) >= 6:
+                self.prefix_counter[normed[:40]] += 1
+                self.suffix_counter[normed[-40:]] += 1
 
         # 确定性蓄水池抽样：样本帖子按时间均匀分布，便于人工核验
         if len(self.samples) < self.sample_size:
@@ -420,6 +430,20 @@ class _Accumulator:
             "text": text[:TEXT_PREVIEW_CHARS],
             "has_media": bool(row["has_media"]),
         }
+
+    @staticmethod
+    def _top_patterns(counter: Counter, n_text: int, k: int = 3,
+                      min_count: int = 3) -> List[Dict[str, Any]]:
+        """取高频重复句式 top-k（count ≥ min_count，滤掉纯标点/超短句）。"""
+        patterns: List[Dict[str, Any]] = []
+        for pat, count in counter.most_common():
+            if count < min_count or len(pat.strip(" #.:〜～_-=w")) < 6:
+                continue
+            patterns.append({"pattern": pat[:80], "count": count,
+                             "share": _round(count / n_text, 3) if n_text else None})
+            if len(patterns) >= k:
+                break
+        return patterns
 
     def finalize(self) -> Dict[str, Any]:
         self.times.sort()
@@ -456,6 +480,10 @@ class _Accumulator:
                 "mean_text_chars": _round(statistics.fmean(self.text_lens), 1) if self.text_lens else None,
                 "languages": dict(self.langs.most_common(3)),
                 "visibility": dict(self.visibilities.most_common()),
+                "recurring_patterns": {
+                    "prefix": self._top_patterns(self.prefix_counter, n_text),
+                    "suffix": self._top_patterns(self.suffix_counter, n_text),
+                },
             },
             "interaction": {
                 "reply_rate": _round(self.n_reply / self.n, 4) if self.n else None,

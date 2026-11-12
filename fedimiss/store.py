@@ -489,6 +489,37 @@ class Store:
             total += cur.rowcount or 0
         return total
 
+    def claim_accounts_any_pending(self, limit: int, domain: str = None) -> List[Dict[str, Any]]:
+        """原子领取一批「资料或帖子任一为 pending」的账号（逐账号流水线用）。
+
+        与 claim_accounts 的区别：按账号整体领取并同时锁定两个状态列，
+        使同一账号的资料与帖子在同一处理单元内连续完成。
+        """
+        clauses = ["(profile_status='pending' OR notes_status='pending')"]
+        params: List[Any] = []
+        if domain:
+            clauses.append("instance_domain = ?")
+            params.append(domain)
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT account_key FROM accounts WHERE %s "
+                "ORDER BY bfs_depth ASC, discovered_at ASC LIMIT ?" % " AND ".join(clauses),
+                tuple(params),
+            ).fetchall()
+            keys = [r["account_key"] for r in rows]
+            if keys:
+                marks = ",".join("?" * len(keys))
+                self._conn.execute(
+                    "UPDATE accounts SET "
+                    "profile_status = CASE WHEN profile_status='pending' THEN 'running' ELSE profile_status END, "
+                    "notes_status = CASE WHEN notes_status='pending' THEN 'running' ELSE notes_status END "
+                    "WHERE account_key IN (%s)" % marks,
+                    tuple(keys),
+                )
+            self._conn.commit()
+        return [self.get_account(k) for k in keys]
+
     def iter_accounts(self, where: str = "", params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM accounts"
         if where:

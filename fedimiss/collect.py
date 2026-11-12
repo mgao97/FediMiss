@@ -575,6 +575,45 @@ class InstanceCollector:
         })
 
     # ------------------------------------------------------------------ 帖子
+    def run_interleaved(self) -> Dict[str, int]:
+        """逐账号流水线：同一账号的资料→帖子连续处理，尽早产出完整信息账号。
+
+        与「先全部资料、后全部帖子」的分阶段模式相比，每处理完一个账号
+        就立即形成一个可用的完整信息样本（若其有帖子与媒体记录）。
+        """
+        processed = {"profiles": 0, "notes": 0}
+        page_size = min(100, max(1, self.config.limit("notes_page_size")))
+        per_account = max(1, self.config.limit("notes_per_account"))
+        fetch_limit = min(page_size, per_account)
+        max_pages = max(1, (per_account + fetch_limit - 1) // fetch_limit)
+        while True:
+            if self._stopped():
+                self._log("info", "[%s] 收到停止信号，中断流水线", self.domain)
+                break
+            if not self.budgets.can_request(self.domain) or not self.budgets.can_store_note():
+                break
+            batch = self.store.claim_accounts_any_pending(
+                limit=self.account_batch_size, domain=self.domain
+            )
+            if not batch:
+                break
+            for account in batch:
+                if self._stopped():
+                    break
+                if account.get("profile_status") == "running":
+                    self._refresh_profile(account)
+                    processed["profiles"] += 1
+                    # 资料刷新会补齐 local_user_id，取最新行再采帖子
+                    account = self.store.get_account(account["account_key"]) or account
+                if account.get("notes_status") == "running":
+                    self._collect_notes(account, fetch_limit, max_pages, per_account)
+                    processed["notes"] += 1
+        self._log(
+            "info", "[%s] 逐账号流水线完成：资料 %d / 帖子 %d",
+            self.domain, processed["profiles"], processed["notes"],
+        )
+        return processed
+
     def run_notes(self) -> int:
         processed = 0
         page_size = min(100, max(1, self.config.limit("notes_page_size")))
@@ -703,8 +742,13 @@ class InstanceCollector:
             if phase in ("relations", "all"):
                 result["bfs"] = self.run_bfs()
             if phase in ("profiles_media", "all"):
-                result["profiles"] = self.run_profiles()
-                result["notes"] = self.run_notes()
+                if self.config.get("pipeline.interleave", False):
+                    inter = self.run_interleaved()
+                    result["profiles"] = inter["profiles"]
+                    result["notes"] = inter["notes"]
+                else:
+                    result["profiles"] = self.run_profiles()
+                    result["notes"] = self.run_notes()
         except Exception as exc:  # noqa: BLE001
             run_status = "failed"
             self.store.log_error(

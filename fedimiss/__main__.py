@@ -52,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_collect.add_argument("--instances", default=None, help="逗号分隔的实例域名（只采这些）")
     p_collect.add_argument("--workers", type=int, default=None, help="并行实例 worker 数")
     p_collect.add_argument("--seed-pages", type=int, default=3, help="每实例本地时间线翻页数（账号发现）")
+    p_collect.add_argument("--search", action="store_true", help="启用搜索发现（用户名前缀枚举 + 标签搜索，覆盖 discovery 配置）")
+    p_collect.add_argument("--search-budget", type=int, default=None, help="用户名前缀扫描的请求数预算")
+    p_collect.add_argument("--search-tags", default=None, help="逗号分隔的标签列表（缺省从已采帖子中自动挖掘高频标签）")
+    p_collect.add_argument("--search-pages", type=int, default=None, help="每个标签的 notes/search 翻页数")
     p_collect.add_argument("--no-discover", action="store_true", help="不重新校验实例，直接用已有清单")
     p_collect.add_argument("--refresh", action="store_true", help="重新领取并刷新资料、帖子和关系任务")
 
@@ -219,6 +223,31 @@ def cmd_collect(ctx: Context) -> int:
         ctx.discovery.seed_from_timeline(
             domain, max_pages=max(1, args.seed_pages), budget=min(per_instance_cap, remaining)
         )
+
+    # 搜索发现：用户名前缀枚举（主路径）+ 标签搜索（补充路径），
+    # 用于突破本地时间线回溯深度有限导致的新账号枯竭问题。
+    search_on = getattr(args, "search", False) or bool(ctx.config.get("discovery.username_sweep", False))
+    if search_on:
+        sweep_budget = int(
+            getattr(args, "search_budget", None)
+            or ctx.config.get("discovery.search_budget", 1500)
+        )
+        pages = int(getattr(args, "search_pages", None) or ctx.config.get("discovery.search_pages", 2))
+        tags_arg = getattr(args, "search_tags", None)
+        for domain in instances:
+            if ctx.stop_event.is_set():
+                break
+            remaining = ctx.config.limit("max_accounts_total") - ctx.store.count_accounts()
+            if remaining <= 0:
+                break
+            ctx.discovery.seed_from_username_sweep(domain, budget=min(sweep_budget, remaining))
+            tags = _split(tags_arg) if tags_arg else None
+            if tags is None:
+                tags = ctx.discovery.mine_hashtags(
+                    domain, top=int(ctx.config.get("discovery.search_top_tags", 100))
+                )
+            if tags:
+                ctx.discovery.seed_from_hashtag_search(domain, tags, max_pages=max(1, pages), budget=sweep_budget)
 
     dropped = mark_out_of_scope(ctx.store, instances)
     if dropped:
